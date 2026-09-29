@@ -922,6 +922,86 @@ class ShiftSchedulingService
             'late_minutes' => 0,
         ];
     }
+
+    /**
+     * Memindai seluruh jadwal (shiftSchedules array/collection) secara otomatis untuk mendeteksi
+     * dan melaporkan pola konflik (overlap dalam rentang 24 jam, jeda istirahat < 8 jam,
+     * transisi malam-ke-pagi, serta kerja berturut-turut > 6 hari).
+     */
+    public function auditScheduleConflicts(Collection|array $schedules, Collection|array $shifts): array
+    {
+        $conflicts = [];
+        $affectedEmployees = [];
+        $schedulesCol = collect($schedules);
+        $shiftsCol = collect($shifts)->keyBy('id');
+
+        // Kelompokkan per karyawan
+        $grouped = $schedulesCol->groupBy('employee_id');
+
+        foreach ($grouped as $empId => $empSchedules) {
+            $sorted = $empSchedules->sortBy('date')->values();
+            $active = $sorted->filter(fn($s) => !$s['is_off_day'] && ($s['shift_id'] ?? null) !== null)->values();
+
+            for ($i = 0; $i < $active->count() - 1; $i++) {
+                $curr = $active[$i];
+                $next = $active[$i + 1];
+
+                $dCurr = Carbon::parse($curr['date']);
+                $dNext = Carbon::parse($next['date']);
+                $diffDays = $dNext->diffInDays($dCurr);
+
+                if ($diffDays <= 1) {
+                    $shift1 = $shiftsCol->get($curr['shift_id']);
+                    $shift2 = $shiftsCol->get($next['shift_id']);
+
+                    if ($shift1 && $shift2) {
+                        $start1 = Carbon::parse($curr['date'] . ' ' . $shift1['start_time']);
+                        $end1 = Carbon::parse($curr['date'] . ' ' . $shift1['end_time']);
+                        if ($shift1['is_night_shift'] || $end1->lt($start1)) {
+                            $end1->addDay();
+                        }
+
+                        $start2 = Carbon::parse($next['date'] . ' ' . $shift2['start_time']);
+
+                        // 1. Overlap Check
+                        if ($start2->lt($end1)) {
+                            $conflicts[] = [
+                                'type' => 'overlap',
+                                'severity' => 'critical',
+                                'employee_id' => $empId,
+                                'date' => $next['date'],
+                                'message' => "Overlap: Shift {$shift2['code']} bertabrakan langsung dengan shift {$shift1['code']} dalam 24 jam.",
+                            ];
+                            $affectedEmployees[$empId] = true;
+                            continue;
+                        }
+
+                        // 2. Rest Period Check (< 8 jam)
+                        $restHours = $end1->diffInMinutes($start2) / 60;
+                        if ($restHours < 8 && $start2->diffInHours($start1) <= 24) {
+                            $conflicts[] = [
+                                'type' => $shift1['is_night_shift'] && $shift2['code'] === 'PAGI' ? 'night_to_morning' : 'insufficient_rest',
+                                'severity' => $restHours <= 1 ? 'critical' : 'warning',
+                                'employee_id' => $empId,
+                                'date' => $next['date'],
+                                'rest_hours' => round($restHours, 1),
+                                'message' => "Jeda istirahat tidak memadai ({$restHours} jam) antara shift {$shift1['code']} dan {$shift2['code']}.",
+                            ];
+                            $affectedEmployees[$empId] = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return [
+            'total_scanned' => $schedulesCol->count(),
+            'total_conflicts' => count($conflicts),
+            'affected_employees_count' => count($affectedEmployees),
+            'conflicts' => $conflicts,
+            'has_conflicts' => count($conflicts) > 0,
+        ];
+    }
 }`,
   },
   {

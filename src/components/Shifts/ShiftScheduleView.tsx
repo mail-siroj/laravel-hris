@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState } from 'react';
 import {
   CalendarClock,
   Clock,
@@ -25,11 +25,24 @@ import {
   Filter,
   AlertOctagon,
   ShieldAlert,
-  ArrowRight,
-  HelpCircle,
   Wrench,
+  Search,
+  CheckCheck,
 } from 'lucide-react';
-import { Shift, ShiftPattern, EmployeeShiftSchedule, Employee, Department, UserRole } from '../../types/hris';
+import {
+  Shift,
+  ShiftPattern,
+  EmployeeShiftSchedule,
+  Employee,
+  Department,
+  UserRole,
+  ShiftAuditReport,
+  ShiftConflictItem,
+} from '../../types/hris';
+import {
+  auditShiftSchedules,
+  checkProspectiveShiftConflict,
+} from '../../utils/shiftConflictAuditor';
 
 interface ShiftScheduleViewProps {
   shifts: Shift[];
@@ -38,6 +51,8 @@ interface ShiftScheduleViewProps {
   employees: Employee[];
   departments: Department[];
   currentRole: UserRole;
+  auditReport: ShiftAuditReport;
+  onRunFullAudit: () => ShiftAuditReport;
   onAddShift: (shift: Shift) => void;
   onUpdateShift: (shift: Shift) => void;
   onAddShiftPattern: (pattern: ShiftPattern) => void;
@@ -56,20 +71,6 @@ interface ShiftScheduleViewProps {
   ) => void;
 }
 
-export interface ShiftConflictInfo {
-  employeeId: string;
-  employeeName: string;
-  date: string;
-  shiftName: string;
-  shiftCode: string;
-  conflictingDate: string;
-  conflictingShiftName: string;
-  conflictingShiftCode: string;
-  type: 'overlap' | 'insufficient_rest' | 'night_to_morning';
-  restHours: number;
-  message: string;
-}
-
 export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
   shifts,
   patterns,
@@ -77,6 +78,8 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
   employees,
   departments,
   currentRole,
+  auditReport,
+  onRunFullAudit,
   onAddShift,
   onUpdateShift,
   onAddShiftPattern,
@@ -85,7 +88,7 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
   onApplyRecurringPattern,
   onUpdateScheduleCell,
 }) => {
-  const [activeSubTab, setActiveSubTab] = useState<'roster' | 'master' | 'patterns'>('roster');
+  const [activeSubTab, setActiveSubTab] = useState<'roster' | 'master' | 'patterns' | 'audit'>('roster');
   const [selectedDept, setSelectedDept] = useState<string>('all');
   const [conflictOnlyFilter, setConflictOnlyFilter] = useState(false);
 
@@ -137,7 +140,7 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
     empName: string;
     shiftId: string;
     shiftName: string;
-    conflict: ShiftConflictInfo;
+    conflict: ShiftConflictItem;
   } | null>(null);
 
   // Conflict Audit Modal Drawer State
@@ -157,205 +160,9 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
     return { dateStr, dayName, dayFullName, dayNumber, isToday };
   });
 
-  // Helper function to calculate exact start and end Date objects for a scheduled shift
-  const getShiftTimeRange = (dateStr: string, shift: Shift): { start: Date; end: Date } => {
-    const [startH, startM] = shift.startTime.split(':').map(Number);
-    const [endH, endM] = shift.endTime.split(':').map(Number);
-
-    const startDate = new Date(`${dateStr}T00:00:00`);
-    startDate.setHours(startH, startM, 0, 0);
-
-    const endDate = new Date(`${dateStr}T00:00:00`);
-    if (shift.isNightShift || endH < startH) {
-      // Overnight night shift ends next morning
-      endDate.setDate(endDate.getDate() + 1);
-    }
-    endDate.setHours(endH, endM, 0, 0);
-
-    return { start: startDate, end: endDate };
-  };
-
-  // Evaluate conflict between two scheduled shifts
-  const checkConflictBetweenShifts = (
-    empId: string,
-    empName: string,
-    date1: string,
-    shift1: Shift,
-    date2: string,
-    shift2: Shift
-  ): ShiftConflictInfo | null => {
-    const range1 = getShiftTimeRange(date1, shift1);
-    const range2 = getShiftTimeRange(date2, shift2);
-
-    // Make sure range1 is earlier than range2
-    const [firstRange, secondRange, firstDate, secondDate, firstShift, secondShift] =
-      range1.start.getTime() <= range2.start.getTime()
-        ? [range1, range2, date1, date2, shift1, shift2]
-        : [range2, range1, date2, date1, shift2, shift1];
-
-    // Check for direct overlap
-    if (secondRange.start.getTime() < firstRange.end.getTime()) {
-      return {
-        employeeId: empId,
-        employeeName: empName,
-        date: secondDate,
-        shiftName: secondShift.name,
-        shiftCode: secondShift.code,
-        conflictingDate: firstDate,
-        conflictingShiftName: firstShift.name,
-        conflictingShiftCode: firstShift.code,
-        type: 'overlap',
-        restHours: 0,
-        message: `Tumpang-tindih (Overlap): Jam shift ${secondShift.code} (${secondShift.startTime}-${secondShift.endTime}) bertabrakan langsung dengan shift ${firstShift.code} (${firstShift.startTime}-${firstShift.endTime}) pada rentang 24 jam.`,
-      };
-    }
-
-    // Check rest period between shifts
-    const restMillis = secondRange.start.getTime() - firstRange.end.getTime();
-    const restHours = Math.round((restMillis / (1000 * 60 * 60)) * 10) / 10;
-
-    // Direct Night -> Morning conflict (e.g. Night shift ending at 07:00, Morning starting at 07:00 -> 0h rest)
-    if (firstShift.isNightShift && secondShift.code === 'PAGI' && restHours <= 1) {
-      return {
-        employeeId: empId,
-        employeeName: empName,
-        date: secondDate,
-        shiftName: secondShift.name,
-        shiftCode: secondShift.code,
-        conflictingDate: firstDate,
-        conflictingShiftName: firstShift.name,
-        conflictingShiftCode: firstShift.code,
-        type: 'night_to_morning',
-        restHours,
-        message: `Konflik Berbahaya (Malam ke Pagi): Karyawan baru selesai Shift Malam pukul ${firstShift.endTime} WIB pada ${firstDate}, langsung dijadwalkan Shift Pagi pukul ${secondShift.startTime} WIB pada ${secondDate} (Jeda istirahat hanya ${restHours} jam).`,
-      };
-    }
-
-    // Standard labor regulation minimum rest between consecutive shifts is 8 to 11 hours
-    if (restHours < 8 && secondRange.start.getTime() - firstRange.start.getTime() <= 24 * 60 * 60 * 1000) {
-      return {
-        employeeId: empId,
-        employeeName: empName,
-        date: secondDate,
-        shiftName: secondShift.name,
-        shiftCode: secondShift.code,
-        conflictingDate: firstDate,
-        conflictingShiftName: firstShift.name,
-        conflictingShiftCode: firstShift.code,
-        type: 'insufficient_rest',
-        restHours,
-        message: `Jeda Istirahat Kurang: Jeda antar shift hanya ${restHours} jam (Standar keselamatan & UU Ketenagakerjaan: min. 8-11 jam istirahat antar shift).`,
-      };
-    }
-
-    return null;
-  };
-
-  // Check if a prospective shift assignment creates a conflict for an employee
-  const checkProspectiveConflict = (
-    empId: string,
-    empName: string,
-    targetDate: string,
-    newShiftId: string
-  ): ShiftConflictInfo | null => {
-    if (newShiftId === 'OFF') return null;
-    const prospectiveShift = shifts.find((s) => s.id === newShiftId);
-    if (!prospectiveShift) return null;
-
-    // Check adjacent days: previous day and next day
-    const targetD = new Date(`${targetDate}T00:00:00`);
-
-    const prevD = new Date(targetD);
-    prevD.setDate(prevD.getDate() - 1);
-    const prevDateStr = prevD.toISOString().split('T')[0];
-
-    const nextD = new Date(targetD);
-    nextD.setDate(nextD.getDate() + 1);
-    const nextDateStr = nextD.toISOString().split('T')[0];
-
-    // Find previous day schedule
-    const prevSched = schedules.find((s) => s.employeeId === empId && s.date === prevDateStr);
-    if (prevSched && !prevSched.isOffDay && prevSched.shiftId !== 'OFF') {
-      const prevShift = shifts.find((s) => s.id === prevSched.shiftId);
-      if (prevShift) {
-        const conflict = checkConflictBetweenShifts(
-          empId,
-          empName,
-          prevDateStr,
-          prevShift,
-          targetDate,
-          prospectiveShift
-        );
-        if (conflict) return conflict;
-      }
-    }
-
-    // Find next day schedule
-    const nextSched = schedules.find((s) => s.employeeId === empId && s.date === nextDateStr);
-    if (nextSched && !nextSched.isOffDay && nextSched.shiftId !== 'OFF') {
-      const nextShift = shifts.find((s) => s.id === nextSched.shiftId);
-      if (nextShift) {
-        const conflict = checkConflictBetweenShifts(
-          empId,
-          empName,
-          targetDate,
-          prospectiveShift,
-          nextDateStr,
-          nextShift
-        );
-        if (conflict) return conflict;
-      }
-    }
-
-    return null;
-  };
-
-  // Global scan of all conflicts currently present in the schedule
-  const allDetectedConflicts: ShiftConflictInfo[] = useMemo(() => {
-    const list: ShiftConflictInfo[] = [];
-
-    // Group schedules by employee
-    employees.forEach((emp) => {
-      const empSchedules = schedules
-        .filter((s) => s.employeeId === emp.id && !s.isOffDay && s.shiftId !== 'OFF')
-        .sort((a, b) => a.date.localeCompare(b.date));
-
-      for (let i = 0; i < empSchedules.length - 1; i++) {
-        const current = empSchedules[i];
-        const next = empSchedules[i + 1];
-
-        // Check if dates are adjacent or within 1 day
-        const currD = new Date(`${current.date}T00:00:00`);
-        const nextD = new Date(`${next.date}T00:00:00`);
-        const diffDays = Math.round((nextD.getTime() - currD.getTime()) / (1000 * 60 * 60 * 24));
-
-        if (diffDays <= 1) {
-          const shift1 = shifts.find((s) => s.id === current.shiftId);
-          const shift2 = shifts.find((s) => s.id === next.shiftId);
-
-          if (shift1 && shift2) {
-            const conflict = checkConflictBetweenShifts(
-              emp.id,
-              emp.name,
-              current.date,
-              shift1,
-              next.date,
-              shift2
-            );
-            if (conflict) {
-              list.push(conflict);
-            }
-          }
-        }
-      }
-    });
-
-    return list;
-  }, [schedules, shifts, employees]);
-
-  // Check if a specific cell has an active conflict
-  const getCellConflict = (empId: string, date: string): ShiftConflictInfo | undefined => {
-    return allDetectedConflicts.find(
+  // Check if a specific cell has an active conflict from the current audit report
+  const getCellConflict = (empId: string, date: string): ShiftConflictItem | undefined => {
+    return auditReport.conflicts.find(
       (c) => c.employeeId === empId && (c.date === date || c.conflictingDate === date)
     );
   };
@@ -363,7 +170,7 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
   const filteredEmployees = employees.filter((e) => {
     const matchDept = selectedDept === 'all' || e.departmentId === selectedDept;
     if (!conflictOnlyFilter) return matchDept;
-    const hasConflict = allDetectedConflicts.some((c) => c.employeeId === e.id);
+    const hasConflict = auditReport.affectedEmployeeIds.includes(e.id);
     return matchDept && hasConflict;
   });
 
@@ -630,12 +437,14 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
   const handleSelectShiftForCell = (shiftId: string) => {
     if (!activeCellPop) return;
 
-    // Evaluate prospective conflict
-    const conflict = checkProspectiveConflict(
+    // Evaluate prospective conflict using the conflict auditor
+    const conflict = checkProspectiveShiftConflict(
       activeCellPop.empId,
       activeCellPop.empName,
       activeCellPop.date,
-      shiftId
+      shiftId,
+      schedules,
+      shifts
     );
 
     if (conflict) {
@@ -653,7 +462,7 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
       return;
     }
 
-    // No conflict: update directly
+    // No conflict: update directly (triggers automatic audit check across the entire array)
     onUpdateScheduleCell(activeCellPop.empId, activeCellPop.date, shiftId);
     setActiveCellPop(null);
   };
@@ -681,37 +490,62 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
             <span className="text-xs text-slate-500">Pola Berulang: Pagi · Siang · Malam · Reguler</span>
           </div>
           <h2 className="text-xl font-bold text-slate-900 dark:text-white mt-1">
-            Penjadwalan Shift & Deteksi Konflik Jadwal (24 Jam)
+            Penjadwalan Shift & Deteksi Konflik Pola Otomatis
           </h2>
           <p className="text-xs text-slate-500 max-w-2xl mt-0.5">
-            Manajer dapat mengatur jadwal rotasi shift berulang, memantau kecukupan personel, serta mendapatkan peringatan dini
-            otomatis jika terdapat konflik jadwal (shift tumpang-tindih atau jeda istirahat &lt; 8-11 jam dalam 24 jam).
+            Sistem otomatis memindai seluruh jadwal penugasan kerja karyawan setiap kali terjadi perubahan jadwal untuk mendeteksi
+            tumpang tindih (*overlap*), jeda istirahat kurang dari 8 jam, dan pola kerja berlebihan.
           </p>
         </div>
 
-        {canManage && (
-          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-            <button
-              onClick={handleOpenCreatePattern}
-              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-white dark:bg-slate-800 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-800 hover:bg-indigo-50 dark:hover:bg-slate-700 transition-colors shadow-xs"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Buat Pola Baru</span>
-            </button>
-
-            <button
-              onClick={() => setShowApplyPatternModal(true)}
-              className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-colors shadow-xs"
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              <span>Terapkan Pola Shift Berulang</span>
-            </button>
+        <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+          {/* Real-time Health Audit Pill */}
+          <div
+            className={`px-3 py-2 rounded-xl text-xs font-bold border flex items-center gap-2 cursor-pointer transition-colors ${
+              auditReport.hasConflicts
+                ? 'bg-rose-50 dark:bg-rose-950/70 border-rose-300 dark:border-rose-800 text-rose-800 dark:text-rose-300 hover:bg-rose-100'
+                : 'bg-emerald-50 dark:bg-emerald-950/70 border-emerald-300 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300'
+            }`}
+            onClick={() => setActiveSubTab('audit')}
+            title="Klik untuk melihat laporan audit lengkap"
+          >
+            {auditReport.hasConflicts ? (
+              <>
+                <ShieldAlert className="w-4 h-4 text-rose-600 animate-pulse" />
+                <span>{auditReport.totalConflicts} Konflik Terdeteksi ({auditReport.criticalCount} Kritis)</span>
+              </>
+            ) : (
+              <>
+                <CheckCircle className="w-4 h-4 text-emerald-600" />
+                <span>Bebas Konflik ({auditReport.totalSchedulesScanned} Terverifikasi)</span>
+              </>
+            )}
           </div>
-        )}
+
+          {canManage && (
+            <>
+              <button
+                onClick={handleOpenCreatePattern}
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-white dark:bg-slate-800 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-800 hover:bg-indigo-50 dark:hover:bg-slate-700 transition-colors shadow-xs"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Buat Pola Baru</span>
+              </button>
+
+              <button
+                onClick={() => setShowApplyPatternModal(true)}
+                className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-colors shadow-xs"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Terapkan Pola Shift Berulang</span>
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Global Conflict Alert Banner */}
-      {allDetectedConflicts.length > 0 && (
+      {auditReport.hasConflicts && (
         <div className="p-4 rounded-2xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900/60 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-start gap-3">
             <div className="p-2 rounded-xl bg-rose-600 text-white shrink-0 mt-0.5">
@@ -720,14 +554,14 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
             <div>
               <div className="flex items-center gap-2">
                 <h4 className="text-sm font-bold text-rose-900 dark:text-rose-200">
-                  Peringatan Sistem: {allDetectedConflicts.length} Konflik Jadwal Terdeteksi!
+                  Peringatan Sistem: {auditReport.summaryMessage}
                 </h4>
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-200 dark:bg-rose-900 text-rose-800 dark:text-rose-300">
-                  Perlu Atensi Manajer
+                  Update Terakhir: {auditReport.auditedAt}
                 </span>
               </div>
               <p className="text-xs text-rose-700 dark:text-rose-300 mt-0.5">
-                Ditemukan jadwal karyawan dengan waktu shift tumpang-tindih atau jeda istirahat tidak mencukupi (&lt; 8 jam) antar shift berurutan dalam rentang 24 jam.
+                Pemeriksaan otomatis mendeteksi jadwal yang bertabrakan atau istirahat kurang dari 8 jam. Klik Audit untuk melihat detail dan opsi pemecahan cepat.
               </p>
             </div>
           </div>
@@ -745,11 +579,11 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
             </button>
 
             <button
-              onClick={() => setShowConflictAuditModal(true)}
+              onClick={() => setActiveSubTab('audit')}
               className="px-3.5 py-1.5 rounded-xl text-xs font-bold bg-rose-600 hover:bg-rose-500 text-white transition-colors shadow-xs flex items-center gap-1.5"
             >
               <Wrench className="w-3.5 h-3.5" />
-              <span>Audit & Selesaikan Konflik</span>
+              <span>Lihat Laporan Audit ({auditReport.totalConflicts})</span>
             </button>
           </div>
         </div>
@@ -792,6 +626,22 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
           <Clock className="w-3.5 h-3.5" />
           <span>Master Jam Shift ({shifts.length})</span>
         </button>
+
+        <button
+          onClick={() => setActiveSubTab('audit')}
+          className={`px-3.5 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2 ${
+            activeSubTab === 'audit'
+              ? 'bg-indigo-600 text-white shadow-xs'
+              : auditReport.hasConflicts
+              ? 'bg-rose-100 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border border-rose-300 dark:border-rose-800'
+              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+          }`}
+        >
+          <ShieldAlert className="w-3.5 h-3.5" />
+          <span>
+            Laporan Audit Konflik {auditReport.totalConflicts > 0 ? `(${auditReport.totalConflicts})` : ''}
+          </span>
+        </button>
       </div>
 
       {/* SUBTAB 1: Roster Matrix Calendar View */}
@@ -817,7 +667,7 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
                 ))}
               </select>
 
-              {allDetectedConflicts.length > 0 && (
+              {auditReport.hasConflicts && (
                 <button
                   onClick={() => setConflictOnlyFilter(!conflictOnlyFilter)}
                   className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-colors ${
@@ -826,7 +676,7 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
                       : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-100'
                   }`}
                 >
-                  ⚠️ Filter Konflik ({allDetectedConflicts.length})
+                  ⚠️ Filter Konflik ({auditReport.affectedEmployeesCount} Staf)
                 </button>
               )}
             </div>
@@ -947,11 +797,11 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
                           <div>
                             <div className="flex items-center gap-1.5">
                               <span>{emp.name}</span>
-                              {allDetectedConflicts.some((c) => c.employeeId === emp.id) && (
+                              {auditReport.affectedEmployeeIds.includes(emp.id) && (
                                 <span
                                   className="px-1 py-0.2 rounded text-[9px] font-bold bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300 border border-rose-300 cursor-pointer"
-                                  title="Karyawan ini memiliki konflik shift"
-                                  onClick={() => setShowConflictAuditModal(true)}
+                                  title="Karyawan ini memiliki konflik shift terdeteksi"
+                                  onClick={() => setActiveSubTab('audit')}
                                 >
                                   ⚠️ Konflik
                                 </span>
@@ -1025,7 +875,7 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
 
                               {cellConflict && (
                                 <span className="text-[8px] font-bold text-rose-700 dark:text-rose-300 block leading-tight">
-                                  {cellConflict.type === 'night_to_morning' ? 'Mlm ➔ Pagi' : 'Overlap'}
+                                  {cellConflict.type === 'night_to_morning' ? 'Mlm ➔ Pagi' : 'Konflik'}
                                 </span>
                               )}
                             </button>
@@ -1064,7 +914,7 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
 
               {canManage && (
                 <span className="text-[11px] text-slate-500 italic">
-                  💡 Tips: Klik kotak jadwal pada tabel untuk mengubah shift per individu. Sistem otomatis mencegah jadwal yang bertabrakan.
+                  💡 Tips: Klik kotak jadwal pada tabel untuk mengubah shift per individu. Sistem otomatis memindai seluruh array jadwal.
                 </span>
               )}
             </div>
@@ -1287,6 +1137,179 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* SUBTAB 4: Dedicated Full Shift Audit Report Tab */}
+      {activeSubTab === 'audit' && (
+        <div className="space-y-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                  Pusat Audit & Laporan Deteksi Konflik Pola Shift
+                </h3>
+                <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800">
+                  Auto-Check Engine
+                </span>
+              </div>
+              <p className="text-xs text-slate-500">
+                Pemeriksaan komprehensif seluruh array jadwal penugasan ({auditReport.totalSchedulesScanned} data) untuk kepatuhan jam istirahat dan anti-overlap.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => onRunFullAudit()}
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-colors shadow-xs"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Pindai Ulang Seluruh Jadwal</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Audit Metrics Cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+            <div className="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-xs">
+              <span className="text-[10px] uppercase font-bold text-slate-400 block tracking-wider">
+                Total Jadwal Terpindai
+              </span>
+              <div className="text-2xl font-bold font-mono text-slate-900 dark:text-white mt-1">
+                {auditReport.totalSchedulesScanned}
+              </div>
+              <span className="text-[11px] text-slate-500">Across all employees</span>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-xs">
+              <span className="text-[10px] uppercase font-bold text-rose-500 block tracking-wider">
+                Konflik Kritis (Overlap / 0 Jam)
+              </span>
+              <div className="text-2xl font-bold font-mono text-rose-600 dark:text-rose-400 mt-1">
+                {auditReport.criticalCount}
+              </div>
+              <span className="text-[11px] text-slate-500">Perlu penanganan segera</span>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-xs">
+              <span className="text-[10px] uppercase font-bold text-amber-500 block tracking-wider">
+                Peringatan Istirahat (&lt; 8 Jam)
+              </span>
+              <div className="text-2xl font-bold font-mono text-amber-600 dark:text-amber-400 mt-1">
+                {auditReport.warningCount}
+              </div>
+              <span className="text-[11px] text-slate-500">Potensi fatigue / kelelahan</span>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-xs">
+              <span className="text-[10px] uppercase font-bold text-indigo-500 block tracking-wider">
+                Karyawan Terdampak
+              </span>
+              <div className="text-2xl font-bold font-mono text-indigo-600 dark:text-indigo-400 mt-1">
+                {auditReport.affectedEmployeesCount}
+              </div>
+              <span className="text-[11px] text-slate-500">Dari total {employees.length} staf</span>
+            </div>
+          </div>
+
+          {/* Audit Results List */}
+          {auditReport.conflicts.length === 0 ? (
+            <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-12 text-center space-y-3">
+              <div className="w-12 h-12 rounded-full bg-emerald-100 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400 flex items-center justify-center mx-auto">
+                <CheckCheck className="w-6 h-6" />
+              </div>
+              <h4 className="text-base font-bold text-slate-900 dark:text-white">
+                Seluruh Jadwal Memenuhi Standar & Bebas Konflik
+              </h4>
+              <p className="text-xs text-slate-500 max-w-md mx-auto">
+                Tidak ditemukan jadwal shift yang bertabrakan, jeda istirahat di bawah 8 jam, atau pola kerja berlebihan tanpa libur mingguan.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                  Daftar Konflik Jadwal Aktif ({auditReport.conflicts.length}):
+                </span>
+                <span className="text-[11px] text-slate-400">
+                  Gunakan tombol tindakan cepat untuk menyelesaikan konflik
+                </span>
+              </div>
+
+              {auditReport.conflicts.map((c) => (
+                <div
+                  key={c.id}
+                  className="bg-white dark:bg-slate-900 rounded-2xl border border-rose-200 dark:border-rose-900/60 p-4 shadow-xs space-y-3"
+                >
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-2 rounded-xl bg-rose-100 dark:bg-rose-950 text-rose-600 shrink-0">
+                        <AlertOctagon className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-slate-900 dark:text-white text-sm">
+                            {c.employeeName}
+                          </span>
+                          <span className="text-xs text-slate-400">({c.departmentName})</span>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                              c.severity === 'critical'
+                                ? 'bg-rose-600 text-white'
+                                : 'bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300'
+                            }`}
+                          >
+                            {c.severity === 'critical' ? 'KRITIS' : 'PERINGATAN'}
+                          </span>
+                        </div>
+                        <span className="text-[11px] text-slate-500 font-mono">
+                          Rentang: {c.conflictingDate} ➔ {c.date}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="text-right">
+                      <span className="text-[10px] text-slate-400 font-mono">
+                        Terdeteksi otomatis pukul {c.detectedAt}
+                      </span>
+                    </div>
+                  </div>
+
+                  <p className="text-xs text-rose-800 dark:text-rose-300 font-medium bg-rose-50 dark:bg-rose-950/40 p-2.5 rounded-xl border border-rose-100 dark:border-rose-900/60">
+                    {c.message}
+                  </p>
+
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-2 border-t border-slate-100 dark:border-slate-800 text-xs">
+                    <div className="flex items-center gap-1.5 text-indigo-700 dark:text-indigo-300 text-[11px]">
+                      <Sparkles className="w-3.5 h-3.5 shrink-0" />
+                      <span>Rekomendasi Solusi: <strong>{c.recommendation}</strong></span>
+                    </div>
+
+                    {canManage && (
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          onClick={() => {
+                            onUpdateScheduleCell(c.employeeId, c.date, 'OFF');
+                          }}
+                          className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 font-semibold text-[11px] transition-colors"
+                        >
+                          Ubah {c.date} jadi Libur (OFF)
+                        </button>
+                        <button
+                          onClick={() => {
+                            onUpdateScheduleCell(c.employeeId, c.date, 'shift-siang');
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-[11px] transition-colors"
+                        >
+                          Pindahkan ke Shift Siang
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -1553,8 +1576,8 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
               </div>
 
               <div className="p-3 rounded-lg bg-indigo-50 dark:bg-indigo-950/40 text-indigo-900 dark:text-indigo-200 text-[11px] leading-relaxed">
-                ℹ️ Sistem akan mengulang rotasi siklus pola secara otomatis untuk tanggal-tanggal yang dipilih
-                dan memvalidasi agar tidak terjadi konflik shift dalam jendela 24 jam.
+                ℹ️ Sistem otomatis memindai seluruh array jadwal karyawan dan memastikan pola yang diterapkan
+                tidak memicu konflik istirahat dalam jendela 24 jam.
               </div>
 
               <div className="flex justify-end gap-2 pt-3 border-t border-slate-100 dark:border-slate-800">
@@ -1760,11 +1783,13 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
               </span>
               <div className="space-y-1.5">
                 {shifts.map((sh) => {
-                  const prospectiveConflict = checkProspectiveConflict(
+                  const prospectiveConflict = checkProspectiveShiftConflict(
                     activeCellPop.empId,
                     activeCellPop.empName,
                     activeCellPop.date,
-                    sh.id
+                    sh.id,
+                    schedules,
+                    shifts
                   );
                   const isSelected = activeCellPop.currentShiftId === sh.id;
 
@@ -1921,108 +1946,6 @@ export const ShiftScheduleView: React.FC<ShiftScheduleViewProps> = ({
               >
                 <Check className="w-3.5 h-3.5" />
                 <span>Tetap Simpan (Override Manajer)</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* MODAL 6: Conflict Audit & Resolution Drawer */}
-      {showConflictAuditModal && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-2xl w-full p-6 shadow-2xl border border-slate-200 dark:border-slate-800 space-y-4 text-xs max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
-              <div className="flex items-center gap-2">
-                <div className="p-2.5 rounded-xl bg-rose-600 text-white">
-                  <ShieldAlert className="w-5 h-5" />
-                </div>
-                <div>
-                  <h4 className="text-base font-bold text-slate-900 dark:text-white">
-                    Pusat Audit & Penyelesaian Konflik Shift
-                  </h4>
-                  <p className="text-xs text-slate-500">
-                    Ditemukan {allDetectedConflicts.length} konflik jadwal pada seluruh matriks penugasan kerja.
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => setShowConflictAuditModal(false)}
-                className="text-slate-400 hover:text-slate-600 text-base font-bold"
-              >
-                ✕
-              </button>
-            </div>
-
-            {allDetectedConflicts.length === 0 ? (
-              <div className="py-12 text-center text-slate-500 space-y-2">
-                <CheckCircle className="w-8 h-8 text-emerald-500 mx-auto" />
-                <p className="font-semibold text-slate-800 dark:text-slate-200">
-                  Tidak Ditemukan Konflik Jadwal
-                </p>
-                <p className="text-xs">
-                  Seluruh shift karyawan memenuhi jarak jeda istirahat minimum dan tidak tumpang tindih.
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {allDetectedConflicts.map((c, idx) => (
-                  <div
-                    key={idx}
-                    className="p-3.5 rounded-xl bg-rose-50/60 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-900/60 space-y-2.5"
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <span className="font-bold text-slate-900 dark:text-white text-sm">
-                          {c.employeeName}
-                        </span>
-                        <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-200 dark:bg-rose-900 text-rose-800 dark:text-rose-300">
-                          {c.type === 'night_to_morning' ? 'Malam ➔ Pagi' : 'Overlap'}
-                        </span>
-                      </div>
-                      <span className="text-[11px] font-mono text-slate-500">
-                        {c.conflictingDate} s/d {c.date}
-                      </span>
-                    </div>
-
-                    <div className="text-[11px] text-rose-800 dark:text-rose-300 font-medium">
-                      {c.message}
-                    </div>
-
-                    <div className="flex items-center justify-between pt-2 border-t border-rose-200/60 dark:border-rose-900/60">
-                      <div className="text-[10px] text-slate-500">
-                        Tindakan Perbaikan Cepat:
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => {
-                            onUpdateScheduleCell(c.employeeId, c.date, 'OFF');
-                          }}
-                          className="px-2.5 py-1 rounded-lg bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:bg-slate-100 text-slate-700 dark:text-slate-200 text-[11px] font-semibold transition-colors"
-                        >
-                          Ubah {c.date} jadi Libur (OFF)
-                        </button>
-                        <button
-                          onClick={() => {
-                            onUpdateScheduleCell(c.employeeId, c.date, 'shift-siang');
-                          }}
-                          className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-semibold transition-colors"
-                        >
-                          Geser ke Shift Siang (15:00)
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            <div className="flex justify-end pt-3 border-t border-slate-100 dark:border-slate-800">
-              <button
-                type="button"
-                onClick={() => setShowConflictAuditModal(false)}
-                className="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 font-semibold"
-              >
-                Tutup
               </button>
             </div>
           </div>

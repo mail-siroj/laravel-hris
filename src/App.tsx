@@ -1,5 +1,10 @@
 import React, { useState } from 'react';
-import { UserRole, Employee, Department, Position, AttendanceRecord, LeaveRequest, OvertimeRequest, PayrollRecord, PerformanceAppraisal, Announcement, AppNotification, Shift, ShiftPattern, EmployeeShiftSchedule } from './types/hris';
+import { UserRole, Employee, Department, Position, AttendanceRecord, LeaveRequest, OvertimeRequest, PayrollRecord, PerformanceAppraisal, Announcement, AppNotification, Shift, ShiftPattern, EmployeeShiftSchedule, ShiftAuditReport } from './types/hris';
+import {
+  auditShiftSchedules,
+  auditAndReportShiftConflicts,
+  ShiftAssignmentUpdateContext,
+} from './utils/shiftConflictAuditor';
 import {
   INITIAL_EMPLOYEES,
   INITIAL_DEPARTMENTS,
@@ -48,6 +53,9 @@ export default function App() {
   const [shifts, setShifts] = useState<Shift[]>(INITIAL_SHIFTS);
   const [shiftPatterns, setShiftPatterns] = useState<ShiftPattern[]>(INITIAL_SHIFT_PATTERNS);
   const [shiftSchedules, setShiftSchedules] = useState<EmployeeShiftSchedule[]>(INITIAL_SHIFT_SCHEDULES);
+  const [auditReport, setAuditReport] = useState<ShiftAuditReport>(() =>
+    auditShiftSchedules(INITIAL_SHIFT_SCHEDULES, INITIAL_SHIFTS, INITIAL_EMPLOYEES)
+  );
   const [attendances, setAttendances] = useState<AttendanceRecord[]>(INITIAL_ATTENDANCES);
   const [leaves, setLeaves] = useState<LeaveRequest[]>(INITIAL_LEAVES);
   const [overtimes, setOvertimes] = useState<OvertimeRequest[]>(INITIAL_OVERTIMES);
@@ -176,6 +184,41 @@ export default function App() {
     );
   };
 
+  /**
+   * Automatically runs a comprehensive check across the entire shiftSchedules array
+   * to identify and report conflicting patterns whenever a manager updates an employee's shift assignment.
+   */
+  const runAutoScheduleAuditAndReport = (
+    targetSchedules: EmployeeShiftSchedule[],
+    updateContext?: ShiftAssignmentUpdateContext
+  ): ShiftAuditReport => {
+    const result = auditAndReportShiftConflicts(
+      targetSchedules,
+      shifts,
+      employees,
+      updateContext
+    );
+
+    // Synchronize central audit report state
+    setAuditReport(result.auditReport);
+
+    // Automatically send notification reporting conflict status to manager and HR feeds
+    if (updateContext) {
+      const auditNotif: AppNotification = {
+        id: `audit-notif-${Date.now()}`,
+        title: result.reportNotification.title,
+        message: result.reportNotification.message,
+        type: 'system',
+        createdAt: 'Baru saja',
+        read: false,
+        linkTab: 'shifts',
+      };
+      setNotifications((prev) => [auditNotif, ...prev]);
+    }
+
+    return result.auditReport;
+  };
+
   const handleApplyRecurringPattern = (
     employeeIds: string[],
     patternId: string,
@@ -222,18 +265,18 @@ export default function App() {
     const filteredExisting = shiftSchedules.filter(
       (s) => !newSchedules.some((ns) => ns.employeeId === s.employeeId && ns.date === s.date)
     );
-    setShiftSchedules([...newSchedules, ...filteredExisting]);
+    const nextSchedules = [...newSchedules, ...filteredExisting];
+    setShiftSchedules(nextSchedules);
 
-    const notif: AppNotification = {
-      id: `notif-${Date.now()}`,
-      title: 'Pola Shift Diterapkan',
-      message: `${pattern.name} berhasil diterapkan untuk ${employeeIds.length} karyawan (${days} hari ke depan).`,
-      type: 'system',
-      createdAt: 'Baru saja',
-      read: false,
-      linkTab: 'shifts',
-    };
-    setNotifications([notif, ...notifications]);
+    // Automatically runs a check across the entire shiftSchedules array to identify and report conflicting patterns
+    runAutoScheduleAuditAndReport(nextSchedules, {
+      employeeId: employeeIds[0] || 'batch',
+      employeeName: `${employeeIds.length} Karyawan (Pola: ${pattern.name})`,
+      date: startDateStr,
+      shiftId: pattern.id,
+      shiftName: pattern.name,
+      source: 'pattern_applied',
+    });
   };
 
   const handleUpdateScheduleCell = (employeeId: string, date: string, shiftId: string) => {
@@ -258,16 +301,27 @@ export default function App() {
       notes: 'Penyesuaian manual manajer',
     };
 
+    let nextSchedules: EmployeeShiftSchedule[];
     const existingIndex = shiftSchedules.findIndex(
       (s) => s.employeeId === employeeId && s.date === date
     );
     if (existingIndex >= 0) {
-      const copy = [...shiftSchedules];
-      copy[existingIndex] = updatedCell;
-      setShiftSchedules(copy);
+      nextSchedules = [...shiftSchedules];
+      nextSchedules[existingIndex] = updatedCell;
     } else {
-      setShiftSchedules([updatedCell, ...shiftSchedules]);
+      nextSchedules = [updatedCell, ...shiftSchedules];
     }
+    setShiftSchedules(nextSchedules);
+
+    // Automatically runs a check across the entire shiftSchedules array to identify and report conflicting patterns
+    runAutoScheduleAuditAndReport(nextSchedules, {
+      employeeId,
+      employeeName: emp.name,
+      date,
+      shiftId,
+      shiftName: updatedCell.shiftName,
+      source: 'cell_update',
+    });
   };
 
   // Handlers for Attendance
@@ -658,6 +712,16 @@ export default function App() {
               employees={employees}
               departments={departments}
               currentRole={currentRole}
+              auditReport={auditReport}
+              onRunFullAudit={() =>
+                runAutoScheduleAuditAndReport(shiftSchedules, {
+                  employeeId: 'all',
+                  employeeName: 'Audit Manual Sistem',
+                  date: new Date().toISOString().split('T')[0],
+                  shiftId: 'audit',
+                  source: 'manual_audit',
+                })
+              }
               onAddShift={handleAddShift}
               onUpdateShift={handleUpdateShift}
               onAddShiftPattern={handleAddShiftPattern}

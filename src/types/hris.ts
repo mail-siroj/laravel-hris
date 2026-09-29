@@ -109,6 +109,41 @@ export interface EmployeeShiftSchedule {
   notes?: string;
 }
 
+export type ConflictSeverity = 'critical' | 'warning';
+export type ConflictType = 'overlap' | 'insufficient_rest' | 'night_to_morning' | 'excessive_consecutive_days';
+
+export interface ShiftConflictItem {
+  id: string;
+  employeeId: string;
+  employeeName: string;
+  departmentName?: string;
+  date: string;
+  shiftName: string;
+  shiftCode: string;
+  conflictingDate: string;
+  conflictingShiftName: string;
+  conflictingShiftCode: string;
+  severity: ConflictSeverity;
+  type: ConflictType;
+  restHours: number;
+  message: string;
+  recommendation: string;
+  detectedAt: string;
+}
+
+export interface ShiftAuditReport {
+  totalSchedulesScanned: number;
+  totalConflicts: number;
+  criticalCount: number;
+  warningCount: number;
+  affectedEmployeesCount: number;
+  affectedEmployeeIds: string[];
+  conflicts: ShiftConflictItem[];
+  auditedAt: string;
+  hasConflicts: boolean;
+  summaryMessage: string;
+}
+
 export interface AttendanceRecord {
   id: string;
   employeeId: string;
