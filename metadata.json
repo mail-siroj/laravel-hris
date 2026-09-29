@@ -1,0 +1,6 @@
+{
+  "name": "NEXA-HRIS Enterprise Suite",
+  "description": "Enterprise Human Resource Information System with employee lifecycle management, GPS attendance, multi-tier leave workflows, automated Indonesian payroll with PDF slips, KPI appraisals, and complete Laravel 12 / Filament v4 architecture blueprints.",
+  "requestFramePermissions": ["geolocation", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
